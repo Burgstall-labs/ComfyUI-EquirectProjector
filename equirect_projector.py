@@ -62,7 +62,8 @@ def _crop_to_aspect(image: torch.Tensor, target_aspect: float, align: str = "cen
     if Hi == 0 or Wi == 0:
         return image
     current = Wi / Hi
-    eps = 1e-3
+    # Tolerance absorbs common scope-encode rounding (2.387, 2.4, etc.)
+    eps = 0.01
     if current < target_aspect - eps:
         new_H = max(1, min(int(round(Wi / target_aspect)), Hi))
         excess = Hi - new_H
