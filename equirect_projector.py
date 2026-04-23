@@ -569,6 +569,8 @@ class EquirectSeamLatentComposite:
                 "base_latent": ("LATENT",),
                 "inpainted_latent": ("LATENT",),
                 "seam_mask_latent": ("MASK",),
+                "time_slice": (["auto", "last", "first", "center", "strict"],
+                               {"default": "auto"}),
             },
         }
 
@@ -577,11 +579,34 @@ class EquirectSeamLatentComposite:
     FUNCTION = "composite"
     CATEGORY = "360/projection"
 
-    def composite(self, base_latent, inpainted_latent, seam_mask_latent):
+    def composite(self, base_latent, inpainted_latent, seam_mask_latent, time_slice="auto"):
         base = base_latent["samples"]
         inp = inpainted_latent["samples"]
+
+        # Reconcile a time-dim mismatch on 5D video latents. Common with
+        # LTX-style samplers that concatenate conditioning + denoised frames
+        # along T — we slice the inpainted latent down to base's T.
+        if (base.ndim == 5 and inp.ndim == 5
+                and base.shape[:2] == inp.shape[:2]
+                and base.shape[-2:] == inp.shape[-2:]
+                and base.shape[2] != inp.shape[2]):
+            base_T = base.shape[2]
+            inp_T = inp.shape[2]
+            if time_slice in ("auto", "last") and inp_T >= base_T:
+                inp = inp[:, :, inp_T - base_T:, :, :]
+            elif time_slice == "first" and inp_T >= base_T:
+                inp = inp[:, :, :base_T, :, :]
+            elif time_slice == "center" and inp_T >= base_T:
+                start = (inp_T - base_T) // 2
+                inp = inp[:, :, start:start + base_T, :, :]
+            # "strict" falls through; mismatch raised below.
+
         if base.shape != inp.shape:
-            raise ValueError(f"latent shape mismatch: base {base.shape} vs inpainted {inp.shape}")
+            raise ValueError(
+                f"latent shape mismatch: base {tuple(base.shape)} vs inpainted "
+                f"{tuple(inp.shape)}. If only the T dim differs, try a non-"
+                f"'strict' value for time_slice (currently {time_slice!r})."
+            )
 
         m = seam_mask_latent.to(device=base.device, dtype=base.dtype)
         if m.ndim == 2:

@@ -134,7 +134,11 @@ original:
   LTX-2 video VAE = 32).
 - `EquirectSeamLatentComposite` — `out = base * (1 - mask) + inpainted * mask`
   on latents. Handles both 4D `(B, C, H, W)` and 5D `(B, C, T, H, W)`
-  video latents, auto-resizes mask if needed.
+  video latents, auto-resizes mask if needed. For 5D latents where only the
+  time dim differs (common with LTX samplers that concatenate conditioning +
+  denoised frames), a `time_slice` option slices the inpainted latent to
+  match the base: `auto` / `last` (default) keeps the trailing `base_T`
+  frames, `first` the leading, `center` a centered window, `strict` raises.
 - `EquirectSeamLatentExport` — rolls a `LATENT` back by `-W/2`.
 
 ## Workflows
