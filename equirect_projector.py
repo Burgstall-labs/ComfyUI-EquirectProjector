@@ -583,6 +583,12 @@ class EquirectSeamLatentComposite:
     def composite(self, base_latent, inpainted_latent, seam_mask_latent, time_mode="slice_inp_last"):
         base = base_latent["samples"]
         inp = inpainted_latent["samples"]
+        import logging
+        logging.getLogger().info(
+            f"[EquirectSeamLatentComposite] base shape={tuple(base.shape)} "
+            f"inp shape={tuple(inp.shape)} mask shape={tuple(seam_mask_latent.shape)} "
+            f"time_mode={time_mode}"
+        )
 
         # Reconcile a time-dim mismatch on 5D video latents. LTX samplers often
         # output more frames than the encoded input (e.g. 13 → 26 for
@@ -680,8 +686,19 @@ class EquirectSeamLatentExport:
 
     def export(self, latent):
         samples = latent["samples"]
+        if any(d == 0 for d in samples.shape):
+            raise ValueError(
+                f"EquirectSeamLatentExport received a latent with a zero-sized "
+                f"dim: {tuple(samples.shape)}. Check the upstream LatentComposite "
+                f"(is base_latent's T > 0? is inpainted_latent's T > 0?)."
+            )
         W_lat = samples.shape[-1]
         shifted = torch.roll(samples, shifts=-(W_lat // 2), dims=-1)
+        import logging
+        logging.getLogger().info(
+            f"[EquirectSeamLatentExport] in shape={tuple(samples.shape)} "
+            f"roll={-(W_lat // 2)} out shape={tuple(shifted.shape)}"
+        )
         return ({**latent, "samples": shifted},)
 
 
