@@ -1,15 +1,15 @@
 # ComfyUI-EquirectProjector
 
 ComfyUI custom nodes for working with 360° equirectangular (ERP) imagery and
-video:
+video. Built primarily for the **LTX2.3 VR-Outpaint** model; may work with
+other ERP-aware diffusion / video models too.
 
 1. **Rectilinear → Equirect** — forward gnomonic projection for outpainting a
    normal perspective shot into a full 360° panorama.
 2. **Equirect Seam Inpaint Prep / Export** — rolls the horizontal seam into the
    middle of the frame so you can inpaint across it, then rolls it back.
-
-Both workflows are designed to feed diffusion / video models (SDXL, Flux, LTX,
-Veo, etc.) that don't natively understand ERP geometry or the ±180° wrap.
+3. **Equirect Seam Inpaint Compose** — post-decode cleanup: boundary-anchored
+   local colour-match + feathered composite back onto the clean shifted base.
 
 ## Install
 
@@ -32,7 +32,7 @@ falls back to a slower pure-PyTorch dilation.
 
 Projects a perspective image / video onto a 2:1 equirectangular canvas at a
 chosen `(yaw, pitch)`, producing the distorted / padded ERP image plus an
-outpaint mask marking the region a diffusion model should generate.
+outpaint mask marking the region the model should generate.
 
 | Input | Description |
 |---|---|
@@ -49,9 +49,11 @@ outpaint mask marking the region a diffusion model should generate.
 
 Outputs `(equirect_image, outpaint_mask)`.
 
-**Defaults target a 2.39:1 @ 100° hfov rectilinear source** (cinemascope spherical).
-Feed in any aspect ratio — the node will letterbox-strip and center-crop to 2.39:1
-automatically. Disable `crop_to_239` if your model expects a different aspect.
+**Defaults target a 2.39:1 @ 100° hfov rectilinear source** (cinemascope
+spherical) — which is what the LTX2.3 VR-Outpaint model was trained on.
+Feed in any aspect ratio; the node letterbox-strips and center-crops to 2.39:1
+automatically. Disable `crop_to_239` if you're using a different model that
+expects another aspect.
 
 ### Equirect Seam Inpaint Prep
 
@@ -76,10 +78,6 @@ Outputs `(shifted_image, shifted_clean_image, seam_mask)`:
   clean base in `Equirect Seam Inpaint Compose` or stock `ImageCompositeMasked`
   to avoid the VAE round-trip polluting non-masked pixels.
 - `seam_mask` — binary / feathered stripe mask.
-
-> **Breaking change (v0.2):** prep now returns three outputs. Old workflows
-> that consumed `(shifted_image, seam_mask)` need to reconnect `seam_mask` to
-> the third output socket.
 
 ### Equirect Seam Inpaint Export
 
@@ -122,39 +120,7 @@ Modes:
 
 Output: `IMAGE`.
 
-### Equirect Seam Latent Prep / Composite / Export
-
-Latent-space counterparts to the pixel-space nodes, for a two-pass workflow
-that keeps the first pass' unmasked region bit-identical to the VAE-encoded
-original:
-
-- `EquirectSeamLatentPrep` — rolls a `LATENT` by 50% width along the last
-  spatial axis, emits a latent-resolution `MASK`. Converts `seam_width_px`
-  to latent units via `downsample_factor` (SDXL / SD / LTX image VAE = 8,
-  LTX-2 video VAE = 32).
-- `EquirectSeamLatentComposite` — `out = base * (1 - mask) + inpainted * mask`
-  on latents. Handles both 4D `(B, C, H, W)` and 5D `(B, C, T, H, W)`
-  video latents, auto-resizes mask if needed. For 5D latents where only the
-  time dim differs (common with LTX samplers that concatenate conditioning +
-  denoised frames), a `time_mode` selector reconciles the mismatch:
-  - `slice_inp_last` (default) — keep the last `base_T` frames of the
-    inpainted latent. For LTX-style samplers whose output is
-    `[conditioning | denoised]`, this selects the denoised tail which is
-    the section that was actually run through the shifted latent — so
-    `LatentExport` rolls it back to original coords correctly. The
-    conditioning frames are discarded.
-  - `slice_inp_first` / `_center` — same idea with a different window.
-  - `pad_base` — keep inpainted's full T. Leading frames pass through
-    unchanged. **Warning:** for LTX-style samplers the leading frames are
-    conditioning in original coords; `LatentExport` will mis-shift them
-    and that half of the decoded video will look shifted. Only use when
-    the whole sampler output is uniformly in shifted coords.
-  - `strict` — raise on any mismatch.
-- `EquirectSeamLatentExport` — rolls a `LATENT` back by `-W/2`.
-
-## Workflows
-
-### Pixel-space (single-pass, simplest)
+## Seam-inpainting workflow
 
 ```
 image ─ Prep ─── shifted_image ────── VAEEncode + Inpaint + VAEDecode ──┐
@@ -162,44 +128,17 @@ image ─ Prep ─── shifted_image ────── VAEEncode + Inpaint + 
         └── seam_mask ──────────────────────────────────────────────────┘
 ```
 
-The `Compose` step runs the boundary-anchored colour match and composites
-into `shifted_clean_image`, so unmasked pixels are preserved bit-exact.
-
-### Latent-space (two-pass, for finicky colour shifts)
-
-```
-image ─ VAEEncode ─ L ─ LatentPrep ─┬── L_shifted (clean)                      ┐
-                                     │                                          │
-                                     ├── KSampler (IC-LoRA, mask) ─ L_inpaint ──┤
-                                     │                                          ▼
-                                     └── seam_mask_latent ──────── LatentComposite ─ L_clean_shifted
-                                                                                     │
-                                              LatentExport ─ L_back ◄───────────────┘
-                                                  │
-                                                  └── (optional) 2nd KSampler,
-                                                      standard model, low
-                                                      denoise ─ L_refined
-                                                          │
-                                                          ▼
-                                                      VAEDecode ─ final
-```
-
-Why two passes: after `LatentComposite`, unmasked latent values are
-bit-identical to the encoded original. `LatentExport` then puts the freshly
-generated stripe at the image edges (where it belongs). An optional second
-KSampler at low denoise on the full frame can smooth any residual
-discontinuity where the generated and original latent regions meet.
-
-### Training data for seam-inpaint IC-LoRAs
-
-`Prep → Export` with nothing in between is an identity, so the pair gives
-you a cheap way to produce paired "seam-visible" vs "clean" training frames
-from any clean equirect source.
+`Prep → Export` with nothing in between is an identity — a visible change
+only appears when the inpaint branch actually modifies the stripe region.
+The pair is also useful for building paired training data for ERP seam-repair
+LoRAs / IC-LoRAs: prep gives the "seam in the middle" input, and the clean
+equirect source is the target.
 
 ## Notes
 
-- All nodes operate on ComfyUI's standard `(B, H, W, C)` IMAGE tensors, `float`
-  in `[0, 1]`, and preserve batch dimension (works on video IMAGE batches).
+- All nodes operate on ComfyUI's standard `(B, H, W, C)` IMAGE tensors,
+  `float` in `[0, 1]`, and preserve batch dimension (works on video IMAGE
+  batches).
 - For the seam nodes, image width doesn't need to be even — the export uses
   the negative-shift inverse so round-trip is exact for any `W`.
 - `Rectilinear → Equirect` uses `F.grid_sample` with bilinear filtering and
