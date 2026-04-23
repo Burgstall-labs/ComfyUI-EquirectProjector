@@ -524,6 +524,24 @@ class EquirectSeamLatentPrep:
         samples = latent["samples"]
         if samples.ndim < 4:
             raise ValueError(f"expected LATENT with rank >= 4 (B,C,...,H,W), got {samples.shape}")
+        import logging
+        if any(d == 0 for d in samples.shape):
+            logging.getLogger().info(
+                f"[EquirectSeamLatentPrep] in shape={tuple(samples.shape)} "
+                f"dtype={samples.dtype} device={samples.device} (EMPTY)"
+            )
+            raise ValueError(
+                f"EquirectSeamLatentPrep input latent has a zero-sized dim "
+                f"{tuple(samples.shape)}. Check upstream VAEEncode — is your "
+                f"input video actually non-empty?"
+            )
+        logging.getLogger().info(
+            f"[EquirectSeamLatentPrep] in shape={tuple(samples.shape)} "
+            f"dtype={samples.dtype} device={samples.device} "
+            f"stats(min={samples.float().min().item():.3g}, "
+            f"max={samples.float().max().item():.3g}, "
+            f"mean={samples.float().mean().item():.3g})"
+        )
         W_lat = samples.shape[-1]
         H_lat = samples.shape[-2]
         B = samples.shape[0]
@@ -583,6 +601,24 @@ class EquirectSeamLatentComposite:
     def composite(self, base_latent, inpainted_latent, seam_mask_latent, time_mode="slice_inp_last"):
         base = base_latent["samples"]
         inp = inpainted_latent["samples"]
+        import logging
+        logging.getLogger().info(
+            f"[EquirectSeamLatentComposite] base shape={tuple(base.shape)} dtype={base.dtype} | "
+            f"inp shape={tuple(inp.shape)} dtype={inp.dtype} | "
+            f"mask shape={tuple(seam_mask_latent.shape)} | time_mode={time_mode}"
+        )
+        if any(d == 0 for d in base.shape):
+            raise ValueError(
+                f"EquirectSeamLatentComposite.base_latent has a zero-sized dim "
+                f"{tuple(base.shape)}. Check the connection into base_latent — "
+                f"it should be EquirectSeamLatentPrep's shifted_latent output."
+            )
+        if any(d == 0 for d in inp.shape):
+            raise ValueError(
+                f"EquirectSeamLatentComposite.inpainted_latent has a zero-sized "
+                f"dim {tuple(inp.shape)}. Check the connection into "
+                f"inpainted_latent — it should be the KSampler output."
+            )
 
         # Reconcile a time-dim mismatch on 5D video latents. LTX samplers often
         # output more frames than the encoded input (e.g. 13 → 26 for
@@ -680,6 +716,11 @@ class EquirectSeamLatentExport:
 
     def export(self, latent):
         samples = latent["samples"]
+        import logging
+        logging.getLogger().info(
+            f"[EquirectSeamLatentExport] in shape={tuple(samples.shape)} "
+            f"dtype={samples.dtype}"
+        )
         if any(d == 0 for d in samples.shape):
             raise ValueError(
                 f"EquirectSeamLatentExport received a latent with a zero-sized "
