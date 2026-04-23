@@ -67,7 +67,19 @@ are intended as the inpainting region.
 | `fill_r` / `fill_g` / `fill_b` | Stripe color `[0,1]` |
 | `feather_px` | Soft edge on the mask |
 
-Outputs `(shifted_image, seam_mask)`.
+Outputs `(shifted_image, shifted_clean_image, seam_mask)`:
+
+- `shifted_image` — the rolled frame **with** the fill stripe painted over the
+  seam. Use this as the input to your VAE-encode + inpaint branch.
+- `shifted_clean_image` — the rolled frame **without** the stripe (pure
+  translation, same pixels as the input just roll-shifted). Use this as the
+  clean base in `Equirect Seam Inpaint Compose` or stock `ImageCompositeMasked`
+  to avoid the VAE round-trip polluting non-masked pixels.
+- `seam_mask` — binary / feathered stripe mask.
+
+> **Breaking change (v0.2):** prep now returns three outputs. Old workflows
+> that consumed `(shifted_image, seam_mask)` need to reconnect `seam_mask` to
+> the third output socket.
 
 ### Equirect Seam Inpaint Export
 
@@ -77,32 +89,97 @@ middle and the seam back at the edges. Pair with *Prep* at the start and
 
 Input: `IMAGE`. Output: `IMAGE`.
 
-## Seam-inpainting workflow
+### Equirect Seam Inpaint Compose (color-match + composite)
+
+Post-decode cleanup node: pastes the inpainted stripe into the clean shifted
+base, after optionally colour-matching it to the boundary pixels on each
+side of the mask. Fixes two common inference artefacts:
+
+- VAE encode → sample → decode introduces tiny colour drift in unmasked
+  regions; this node replaces the unmasked region with the original pixels
+  bit-exact.
+- The inpaint model sometimes outputs a stripe that is a touch brighter /
+  darker / colour-cast than its neighbours. Local strip-sampled colour match
+  corrects that without pulling global histograms around.
+
+| Input | Description |
+|---|---|
+| `inpainted_image` | VAE-decoded post-inpaint frame (still in shifted coords) |
+| `clean_shifted_image` | Output 2 of *Prep* — the clean reference |
+| `seam_mask` | Output 3 of *Prep* |
+| `color_match_mode` | `off` · `mean_shift` · `mean_std` · `boundary_gradient` (default) |
+| `match_band_px` | Width of the sampling strip on each side of the mask (default 16) |
+| `composite_feather_px` | Extra feather only at composite boundary (default 8) |
+
+Modes:
+- `mean_shift` — uniform per-channel offset so the inpaint's boundary mean
+  matches the neighbour mean. Safest, never distorts texture.
+- `mean_std` — also scales per-channel std (Reinhard-style).
+- `boundary_gradient` — measures the left and right boundary offsets
+  separately and interpolates a smooth per-column correction across the
+  stripe. Best when the two sides of the frame have different colour casts
+  (e.g. sun on one side, shade on the other).
+
+Output: `IMAGE`.
+
+### Equirect Seam Latent Prep / Composite / Export
+
+Latent-space counterparts to the pixel-space nodes, for a two-pass workflow
+that keeps the first pass' unmasked region bit-identical to the VAE-encoded
+original:
+
+- `EquirectSeamLatentPrep` — rolls a `LATENT` by 50% width along the last
+  spatial axis, emits a latent-resolution `MASK`. Converts `seam_width_px`
+  to latent units via `downsample_factor` (SDXL / SD / LTX image VAE = 8,
+  LTX-2 video VAE = 32).
+- `EquirectSeamLatentComposite` — `out = base * (1 - mask) + inpainted * mask`
+  on latents. Handles both 4D `(B, C, H, W)` and 5D `(B, C, T, H, W)`
+  video latents, auto-resizes mask if needed.
+- `EquirectSeamLatentExport` — rolls a `LATENT` back by `-W/2`.
+
+## Workflows
+
+### Pixel-space (single-pass, simplest)
 
 ```
-Equirect frame
-   │
-   ▼
-EquirectSeamInpaintPrep ── seam_mask ─┐
-   │                                   │
-   ▼                                   ▼
-  (your inpaint pipeline: VAE encode, KSampler with mask, VAE decode, …)
-   │
-   ▼
-EquirectSeamInpaintExport
-   │
-   ▼
-Final equirect frame (seam continuous, original framing restored)
+image ─ Prep ─── shifted_image ────── VAEEncode + Inpaint + VAEDecode ──┐
+        ├── shifted_clean_image ─────────────────────────────────────── Compose ─ Export ─ final
+        └── seam_mask ──────────────────────────────────────────────────┘
 ```
 
-The round-trip `prep → export` with nothing in between is an identity — you'll
-only see a visible change when the inpaint pipeline has modified the stripe
-region.
+The `Compose` step runs the boundary-anchored colour match and composites
+into `shifted_clean_image`, so unmasked pixels are preserved bit-exact.
 
-The seam-inpaint pair is also useful for building paired training data for
-ERP seam-repair LoRAs / IC-LoRAs: prep gives you the "bad" input (visible seam
-artifact in center), and a corresponding ground-truth frame can be produced
-by running the reverse operation on a clean equirect source.
+### Latent-space (two-pass, for finicky colour shifts)
+
+```
+image ─ VAEEncode ─ L ─ LatentPrep ─┬── L_shifted (clean)                      ┐
+                                     │                                          │
+                                     ├── KSampler (IC-LoRA, mask) ─ L_inpaint ──┤
+                                     │                                          ▼
+                                     └── seam_mask_latent ──────── LatentComposite ─ L_clean_shifted
+                                                                                     │
+                                              LatentExport ─ L_back ◄───────────────┘
+                                                  │
+                                                  └── (optional) 2nd KSampler,
+                                                      standard model, low
+                                                      denoise ─ L_refined
+                                                          │
+                                                          ▼
+                                                      VAEDecode ─ final
+```
+
+Why two passes: after `LatentComposite`, unmasked latent values are
+bit-identical to the encoded original. `LatentExport` then puts the freshly
+generated stripe at the image edges (where it belongs). An optional second
+KSampler at low denoise on the full frame can smooth any residual
+discontinuity where the generated and original latent regions meet.
+
+### Training data for seam-inpaint IC-LoRAs
+
+`Prep → Export` with nothing in between is an identity, so the pair gives
+you a cheap way to produce paired "seam-visible" vs "clean" training frames
+from any clean equirect source.
 
 ## Notes
 
