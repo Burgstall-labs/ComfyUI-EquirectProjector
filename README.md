@@ -136,9 +136,15 @@ original:
   on latents. Handles both 4D `(B, C, H, W)` and 5D `(B, C, T, H, W)`
   video latents, auto-resizes mask if needed. For 5D latents where only the
   time dim differs (common with LTX samplers that concatenate conditioning +
-  denoised frames), a `time_slice` option slices the inpainted latent to
-  match the base: `auto` / `last` (default) keeps the trailing `base_T`
-  frames, `first` the leading, `center` a centered window, `strict` raises.
+  denoised frames), a `time_mode` selector reconciles the mismatch:
+  - `pad_base` (default) — **output keeps inpainted's T.** Leading frames
+    pass the inpainted latent through unchanged; trailing `base_T` frames
+    composite normally. Use this so VAE Decode receives the full sampler-
+    length video.
+  - `slice_inp_last` / `_first` / `_center` — output keeps base's T by
+    slicing the inpainted latent. Use when you only want `base_T` frames
+    decoded.
+  - `strict` — raise on any mismatch.
 - `EquirectSeamLatentExport` — rolls a `LATENT` back by `-W/2`.
 
 ## Workflows

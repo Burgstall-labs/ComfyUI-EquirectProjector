@@ -569,8 +569,9 @@ class EquirectSeamLatentComposite:
                 "base_latent": ("LATENT",),
                 "inpainted_latent": ("LATENT",),
                 "seam_mask_latent": ("MASK",),
-                "time_slice": (["auto", "last", "first", "center", "strict"],
-                               {"default": "auto"}),
+                "time_mode": (["pad_base", "slice_inp_last", "slice_inp_first",
+                               "slice_inp_center", "strict"],
+                              {"default": "pad_base"}),
             },
         }
 
@@ -579,33 +580,57 @@ class EquirectSeamLatentComposite:
     FUNCTION = "composite"
     CATEGORY = "360/projection"
 
-    def composite(self, base_latent, inpainted_latent, seam_mask_latent, time_slice="auto"):
+    def composite(self, base_latent, inpainted_latent, seam_mask_latent, time_mode="pad_base"):
         base = base_latent["samples"]
         inp = inpainted_latent["samples"]
 
-        # Reconcile a time-dim mismatch on 5D video latents. Common with
-        # LTX-style samplers that concatenate conditioning + denoised frames
-        # along T — we slice the inpainted latent down to base's T.
+        # Reconcile a time-dim mismatch on 5D video latents. LTX samplers often
+        # output more frames than the encoded input (e.g. 13 → 26 for
+        # conditioning + denoised concatenation).
+        #
+        # pad_base (default): output keeps inp's T. Leading frames copy from
+        #   inp (no compositing); trailing base_T frames composite normally.
+        #   → VAEDecode receives the full sampler-length video.
+        # slice_inp_last/first/center: output keeps base's T by slicing inp.
+        # strict: raise on any mismatch.
         if (base.ndim == 5 and inp.ndim == 5
                 and base.shape[:2] == inp.shape[:2]
                 and base.shape[-2:] == inp.shape[-2:]
                 and base.shape[2] != inp.shape[2]):
-            base_T = base.shape[2]
-            inp_T = inp.shape[2]
-            if time_slice in ("auto", "last") and inp_T >= base_T:
+            base_T, inp_T = base.shape[2], inp.shape[2]
+            if base_T == 0:
+                raise ValueError(
+                    f"base_latent has T=0 but inpainted_latent has T={inp_T}. "
+                    f"Upstream base is empty — check that base_latent is "
+                    f"connected to EquirectSeamLatentPrep's shifted_latent "
+                    f"output (not a KSampler output)."
+                )
+            if time_mode == "pad_base" and inp_T > base_T:
+                # Use inp's leading (inp_T - base_T) frames as the "pad" so
+                # the composite formula out = base*(1-m)+inp*m yields inp for
+                # those frames (no-op compositing there).
+                leading = inp[:, :, :inp_T - base_T, :, :]
+                base = torch.cat([leading, base], dim=2)
+            elif time_mode == "slice_inp_last" and inp_T >= base_T:
                 inp = inp[:, :, inp_T - base_T:, :, :]
-            elif time_slice == "first" and inp_T >= base_T:
+            elif time_mode == "slice_inp_first" and inp_T >= base_T:
                 inp = inp[:, :, :base_T, :, :]
-            elif time_slice == "center" and inp_T >= base_T:
+            elif time_mode == "slice_inp_center" and inp_T >= base_T:
                 start = (inp_T - base_T) // 2
                 inp = inp[:, :, start:start + base_T, :, :]
-            # "strict" falls through; mismatch raised below.
+            # "strict" or unhandled direction (e.g. base_T > inp_T in
+            # pad_base) falls through to the error below.
 
         if base.shape != inp.shape:
             raise ValueError(
                 f"latent shape mismatch: base {tuple(base.shape)} vs inpainted "
-                f"{tuple(inp.shape)}. If only the T dim differs, try a non-"
-                f"'strict' value for time_slice (currently {time_slice!r})."
+                f"{tuple(inp.shape)}. If only the T dim differs, pick a "
+                f"time_mode that handles your direction (currently {time_mode!r})."
+            )
+        if any(d == 0 for d in base.shape):
+            raise ValueError(
+                f"composited latent would have a zero-sized dim {tuple(base.shape)}. "
+                f"Inspect upstream: base_latent or inpainted_latent is empty."
             )
 
         m = seam_mask_latent.to(device=base.device, dtype=base.dtype)
