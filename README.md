@@ -137,13 +137,18 @@ original:
   video latents, auto-resizes mask if needed. For 5D latents where only the
   time dim differs (common with LTX samplers that concatenate conditioning +
   denoised frames), a `time_mode` selector reconciles the mismatch:
-  - `pad_base` (default) — **output keeps inpainted's T.** Leading frames
-    pass the inpainted latent through unchanged; trailing `base_T` frames
-    composite normally. Use this so VAE Decode receives the full sampler-
-    length video.
-  - `slice_inp_last` / `_first` / `_center` — output keeps base's T by
-    slicing the inpainted latent. Use when you only want `base_T` frames
-    decoded.
+  - `slice_inp_last` (default) — keep the last `base_T` frames of the
+    inpainted latent. For LTX-style samplers whose output is
+    `[conditioning | denoised]`, this selects the denoised tail which is
+    the section that was actually run through the shifted latent — so
+    `LatentExport` rolls it back to original coords correctly. The
+    conditioning frames are discarded.
+  - `slice_inp_first` / `_center` — same idea with a different window.
+  - `pad_base` — keep inpainted's full T. Leading frames pass through
+    unchanged. **Warning:** for LTX-style samplers the leading frames are
+    conditioning in original coords; `LatentExport` will mis-shift them
+    and that half of the decoded video will look shifted. Only use when
+    the whole sampler output is uniformly in shifted coords.
   - `strict` — raise on any mismatch.
 - `EquirectSeamLatentExport` — rolls a `LATENT` back by `-W/2`.
 

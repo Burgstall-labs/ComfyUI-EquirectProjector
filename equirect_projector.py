@@ -569,9 +569,9 @@ class EquirectSeamLatentComposite:
                 "base_latent": ("LATENT",),
                 "inpainted_latent": ("LATENT",),
                 "seam_mask_latent": ("MASK",),
-                "time_mode": (["pad_base", "slice_inp_last", "slice_inp_first",
-                               "slice_inp_center", "strict"],
-                              {"default": "pad_base"}),
+                "time_mode": (["slice_inp_last", "slice_inp_first",
+                               "slice_inp_center", "pad_base", "strict"],
+                              {"default": "slice_inp_last"}),
             },
         }
 
@@ -580,18 +580,26 @@ class EquirectSeamLatentComposite:
     FUNCTION = "composite"
     CATEGORY = "360/projection"
 
-    def composite(self, base_latent, inpainted_latent, seam_mask_latent, time_mode="pad_base"):
+    def composite(self, base_latent, inpainted_latent, seam_mask_latent, time_mode="slice_inp_last"):
         base = base_latent["samples"]
         inp = inpainted_latent["samples"]
 
         # Reconcile a time-dim mismatch on 5D video latents. LTX samplers often
         # output more frames than the encoded input (e.g. 13 → 26 for
-        # conditioning + denoised concatenation).
+        # conditioning + denoised concatenation). The leading conditioning
+        # frames are in original coords, the trailing denoised frames are in
+        # shifted coords — so for a correct Export roll-back, keep only the
+        # shifted section.
         #
-        # pad_base (default): output keeps inp's T. Leading frames copy from
-        #   inp (no compositing); trailing base_T frames composite normally.
-        #   → VAEDecode receives the full sampler-length video.
-        # slice_inp_last/first/center: output keeps base's T by slicing inp.
+        # slice_inp_last (default): keep the last base_T frames of inp — the
+        #   denoised section, which IS in shifted coords and rolls back
+        #   correctly via LatentExport.
+        # slice_inp_first/center: same idea, different window.
+        # pad_base: keep inp's full T. Leading frames pass through as-is.
+        #   WARNING: for LTX-style samplers the leading frames are conditioning
+        #   in original coords — Export will incorrectly roll them and you'll
+        #   see shifted content in that half of the decoded video. Only use
+        #   this if you know the sampler output is uniformly in shifted coords.
         # strict: raise on any mismatch.
         if (base.ndim == 5 and inp.ndim == 5
                 and base.shape[:2] == inp.shape[:2]
